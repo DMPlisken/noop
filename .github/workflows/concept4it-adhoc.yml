@@ -1,0 +1,80 @@
+# Privater Ad-hoc-Build für das iPhone des Owners (Concept4IT-Team, nur registrierte Geräte).
+# Nicht Teil von Upstream; nur manuell startbar. Signiert mit Apple-Distribution-Zertifikat + Ad-hoc-Profilen
+# aus Repo-Secrets. App Groups sind bewusst weggelassen (nur für Widget/Watch-Snapshots genutzt).
+name: concept4it-adhoc
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build NOOPiOS for device (unsigned, Release)
+        run: >-
+          xcodebuild -scheme NOOPiOS -configuration Release -destination 'generic/platform=iOS'
+          -derivedDataPath build/dd
+          BUNDLE_ID_PREFIX=de.concept4it
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          build
+      - name: Sign ad hoc + package
+        env:
+          P12_B64: ${{ secrets.C4IT_P12_B64 }}
+          P12_PASSWORD: ${{ secrets.C4IT_P12_PASSWORD }}
+          APP_PROFILE_B64: ${{ secrets.C4IT_APP_PROFILE_B64 }}
+          WIDGET_PROFILE_B64: ${{ secrets.C4IT_WIDGET_PROFILE_B64 }}
+        run: |
+          set -euo pipefail
+          APP=$(find build/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)
+          test -n "$APP" || { echo ".app not found"; exit 1; }
+          rm -rf "$APP/Watch"
+          WIDGET="$APP/PlugIns/NOOPWidgets.appex"
+          test -d "$WIDGET" || { echo "widget missing"; exit 1; }
+          ls "$APP/PlugIns"
+          test "$(ls "$APP/PlugIns" | wc -l | tr -d ' ')" = "1" || { echo "unerwartete weitere Erweiterungen – Profile fehlen"; exit 1; }
+          W="$RUNNER_TEMP/sign"; mkdir -p "$W"
+          echo "$P12_B64" | base64 --decode > "$W/cert.p12"
+          echo "$APP_PROFILE_B64" | base64 --decode > "$W/app.mobileprovision"
+          echo "$WIDGET_PROFILE_B64" | base64 --decode > "$W/widget.mobileprovision"
+          KC="$W/sign.keychain-db"; KCPW=$(uuidgen)
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          security import "$W/cert.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          IDENT=$(security find-identity -v -p codesigning "$KC" | awk -F'"' '/Distribution/{print $2; exit}')
+          test -n "$IDENT" || { echo "no signing identity"; exit 1; }
+          ent() { security cms -D -i "$1" > "$W/p.plist"; /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$W/p.plist" > "$2"; }
+          ent "$W/app.mobileprovision" "$W/app-ent.plist"
+          ent "$W/widget.mobileprovision" "$W/widget-ent.plist"
+          cp "$W/app.mobileprovision" "$APP/embedded.mobileprovision"
+          cp "$W/widget.mobileprovision" "$WIDGET/embedded.mobileprovision"
+          # Infos zum Prüfen (keine Geheimnisse)
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$WIDGET/Info.plist"
+          # Innen nach außen signieren: Frameworks/dylibs, Widget, App
+          find "$APP" -depth \( -name '*.framework' -o -name '*.dylib' \) -print0 | while IFS= read -r -d '' f; do
+            codesign --force --sign "$IDENT" --keychain "$KC" "$f"; done
+          codesign --force --sign "$IDENT" --keychain "$KC" --entitlements "$W/widget-ent.plist" "$WIDGET"
+          codesign --force --sign "$IDENT" --keychain "$KC" --entitlements "$W/app-ent.plist" "$APP"
+          codesign --verify --deep --strict "$APP"
+          VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
+          zip -qry "NOOP-c4it-adhoc.ipa" Payload
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          security delete-keychain "$KC"; rm -rf "$W"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NOOP-c4it-adhoc-${{ env.VER }}
+          path: NOOP-c4it-adhoc.ipa
+          retention-days: 7
